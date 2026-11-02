@@ -1,0 +1,6 @@
+/claude-bouncer.exe
+/claude-bouncer
+*.test
+AGENTS.md
+/agents/
+/altar/
