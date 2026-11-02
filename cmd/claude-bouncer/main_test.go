@@ -530,16 +530,35 @@ func TestHookPolicyEditReleases(t *testing.T) {
 	}
 }
 
-func TestHookRidesOutUnreadableShare(t *testing.T) {
+func TestHookRenamedPolicyReleases(t *testing.T) {
+	// Renaming the policy file (or losing the share) switches the bouncer off,
+	// which also releases calls that are already held.
 	h := newHookRun("2026-11-03 09:00", policy, usageJSON(10, at("2026-11-05 15:00")))
 	h.onSleep = func() {
 		if h.clock.after("2026-11-03 10:00") {
 			delete(h.files, filepath.Clean(cfgPath))
 		}
 	}
-	h.run("sid-other")
-	if !h.clock.t.Equal(at("2026-11-03 13:30")) {
-		t.Errorf("released at %v, want the planned 13:30", h.clock.t)
+	if code := h.run("sid-other"); code != 0 || h.stderr.Len() != 0 {
+		t.Fatalf("code %d, stderr %q", code, h.stderr.String())
+	}
+	if !h.clock.t.Equal(at("2026-11-03 10:00")) {
+		t.Errorf("released at %v, want 10:00 (first poll after the rename)", h.clock.t)
+	}
+}
+
+func TestHookLostUsageReleasesReserveHold(t *testing.T) {
+	h := newHookRun("2026-11-03 14:00", policy, usageJSON(85, at("2026-11-05 15:00")))
+	h.onSleep = func() {
+		if h.clock.after("2026-11-03 15:00") {
+			delete(h.files, filepath.Clean(usagePath))
+		}
+	}
+	if code := h.run("sid-other"); code != 0 || h.stderr.Len() != 0 {
+		t.Fatalf("code %d, stderr %q", code, h.stderr.String())
+	}
+	if !h.clock.t.Equal(at("2026-11-03 15:00")) {
+		t.Errorf("released at %v, want 15:00 (first poll without a usage file)", h.clock.t)
 	}
 }
 
@@ -560,29 +579,32 @@ func TestHookStopsWhenClaudeExits(t *testing.T) {
 	}
 }
 
-func TestHookProblemsDoNotBlock(t *testing.T) {
-	// Missing config: exit 1 (a non-blocking hook error), never 2.
+func TestHookProblemsRunQuietly(t *testing.T) {
+	quiet := func(name string, h *hookRun, code int) {
+		t.Helper()
+		if code != 0 || h.stdout.Len() != 0 || h.stderr.Len() != 0 {
+			t.Errorf("%s: want a silent exit 0, got code %d, stdout %q, stderr %q", name, code, h.stdout.String(), h.stderr.String())
+		}
+	}
+
 	h := newHookRun("2026-11-03 09:00", policy, usageJSON(10, at("2026-11-05 15:00")))
 	h.sys.sleep = noSleep(t)
 	delete(h.files, filepath.Clean(cfgPath))
-	if code := h.run("sid-other"); code != 1 || !strings.Contains(h.stderr.String(), "nothing held") {
-		t.Errorf("missing config: code %d, stderr %q", code, h.stderr.String())
-	}
+	quiet("missing policy", h, h.run("sid-other"))
 
-	// Missing usage file outside the window: the call runs with a warning.
+	h = newHookRun("2026-11-03 09:00", "{not json", usageJSON(10, at("2026-11-05 15:00")))
+	h.sys.sleep = noSleep(t)
+	quiet("broken policy", h, h.run("sid-other"))
+
 	h = newHookRun("2026-11-03 14:00", policy, nil)
 	h.sys.sleep = noSleep(t)
 	delete(h.files, filepath.Clean(usagePath))
-	if code := h.run("sid-other"); code != 1 || !strings.Contains(h.stderr.String(), "not enforced") {
-		t.Errorf("missing usage: code %d, stderr %q", code, h.stderr.String())
-	}
+	quiet("missing usage file", h, h.run("sid-other"))
 
-	// Garbage on stdin.
 	h = newHookRun("2026-11-03 09:00", policy, usageJSON(10, at("2026-11-05 15:00")))
+	h.sys.sleep = noSleep(t)
 	h.sys.stdin = strings.NewReader("not json")
-	if code := hook(options{configPath: cfgPath, usagePath: usagePath, poll: time.Minute}, h.sys); code != 1 {
-		t.Errorf("bad stdin: code %d", code)
-	}
+	quiet("bad stdin", h, hook(options{configPath: cfgPath, usagePath: usagePath, poll: time.Minute}, h.sys))
 }
 
 // --- command line -----------------------------------------------------------
@@ -633,6 +655,16 @@ func TestDryRun(t *testing.T) {
 	out := h.stdout.String()
 	if code != 0 || !strings.Contains(out, "reserve   10.0% x 2 window(s) before reset = 20.0%") ||
 		!strings.Contains(out, "decision  hold until 11/4 13:30") {
+		t.Errorf("code %d, output:\n%s", code, out)
+	}
+}
+
+func TestDryRunWithoutPolicy(t *testing.T) {
+	h := newHookRun("2026-11-03 09:00", policy, usageJSON(10, at("2026-11-05 15:00")))
+	h.sys.stdinIsTerminal = true
+	delete(h.files, filepath.Clean(cfgPath))
+	code := run([]string{"-config", cfgPath, "-usage", usagePath, "-dry-run", "-session", "research"}, h.sys)
+	if out := h.stdout.String(); code != 0 || !strings.Contains(out, "bouncer is off") {
 		t.Errorf("code %d, output:\n%s", code, out)
 	}
 }

@@ -72,7 +72,7 @@ The policy is a JSON file with exactly four fields:
 | `end` | When it closes. A time earlier than `start` means the window runs past midnight. |
 | `daily_reserve` | Percent of the weekly limit kept for the patron for each window left before the weekly reset. |
 
-Unknown fields are rejected, so a typo cannot silently disable a rule.
+A policy with a missing or unknown field is invalid, and an invalid policy switches the bouncer off (see [Failure behavior](#failure-behavior)). After editing it, run `-dry-run` to make sure it is read.
 
 ### Naming the patron
 
@@ -116,7 +116,11 @@ Add the hook to `~/.claude/settings.json` on every machine:
 - **Put it first.** If you already have `PreToolUse` hooks, add this one at the front of the `hooks` array for each matcher, so a held call waits before your other hooks run.
 - **Use forward slashes** in Windows paths. They work in Windows paths, and a shell that treats `\` as an escape leaves them alone.
 
-To release a held call by hand, press `Esc` in that session, or edit the policy file.
+## Switch it off
+
+To pause the bouncer, rename the policy file, for example to `claude-bouncer.json.off`. Without a readable policy every call runs, and calls already held are released within a minute. Rename it back to turn the bouncer on again.
+
+To release a single held call, press `Esc` in that session.
 
 ## Check a decision
 
@@ -153,12 +157,14 @@ Both file paths are required, with no defaults, so the settings file always show
 
 ## Failure behavior
 
-The hook never blocks a tool call outright. It delays it, or it lets it run:
+When anything goes wrong, the call runs, exactly as it would without the hook, and nothing is printed. A problem never gets in the way of using Claude Code; at worst the bouncer is off.
 
-- It never exits with code 2, which would make Claude Code reject the call.
-- If the policy file cannot be read, or the usage file cannot be read outside the window, the call runs. The hook exits with code 1, which Claude Code shows as a hook error notice, so the problem is visible.
-- If the files become unreadable while a call is held, for example because the share drops, the hold continues as planned and ends at its scheduled time.
+- A missing, renamed or broken policy file, or an unreachable share, lets every call run. Held calls are released at the next poll.
+- An unreadable usage file switches off the weekly reserve check. The exclusive window still applies, since it needs only the policy.
+- The hook never rejects a call. It only delays it.
 - If the Claude Code process exits while a call is held, the hook exits too.
+
+Mistakes on the command line, such as an unknown option, are still reported, so a typo in `settings.json` is noticed instead of silently switching the bouncer off. `-dry-run` shows why the policy could not be read.
 
 ## AI provenance
 

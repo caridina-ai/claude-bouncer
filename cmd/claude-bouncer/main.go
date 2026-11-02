@@ -16,11 +16,11 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 const usageText = `claude-bouncer holds Claude Code tool calls to keep quota for a patron session.
 
-Hook (reads the PreToolUse JSON on stdin; never exits 2, so it never blocks a call):
+Hook (reads the PreToolUse JSON on stdin; on any problem the call runs, silently):
   claude-bouncer -config FILE -usage FILE [-poll 1m]
 
 Diagnose without sleeping:
@@ -137,32 +137,29 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 }
 
 // hook is the PreToolUse path: return at once when the call may run, or sleep
-// until it may. Problems that prevent a decision are reported through a
-// non-blocking exit code 1, and the call runs.
+// until it may. It fails open and quietly: when anything goes wrong (a missing
+// or renamed policy file, an unreachable share, unreadable input) the call
+// simply runs, as it would without the hook, and nothing is printed. Renaming
+// the policy file is therefore the way to switch the bouncer off.
 func hook(opts options, sys *system) int {
 	if sys.stdinIsTerminal {
+		// Only reachable when a person runs the command by hand.
 		fmt.Fprintln(sys.stderr, "claude-bouncer: expects Claude Code's PreToolUse JSON on stdin; use -dry-run -session NAME to try it by hand")
 		return 1
 	}
 	in, err := readHookInput(sys.stdin)
 	if err != nil {
-		fmt.Fprintln(sys.stderr, "claude-bouncer:", err)
-		return 1
+		return 0
 	}
 	matcher := newPatronMatcher(in, sys)
 
 	cfg, err := loadConfig(opts.configPath, sys)
 	if err != nil {
-		fmt.Fprintf(sys.stderr, "claude-bouncer: %v; nothing held\n", err)
-		return 1
+		return 0
 	}
 	start := sys.now()
 	v := evaluate(cfg, start, matcher, opts.usagePath, sys)
 	if !v.Hold {
-		if v.Warning != "" {
-			fmt.Fprintln(sys.stderr, "claude-bouncer:", v.Warning)
-			return 1
-		}
 		return 0
 	}
 
@@ -174,8 +171,10 @@ func hook(opts options, sys *system) int {
 }
 
 // holdUntilAllowed sleeps while the call stays held, re-reading both files
-// every poll interval so that edits to the policy take effect. It returns
-// false when the owning Claude Code process has exited in the meantime.
+// every poll interval, so that editing or renaming the policy takes effect
+// within one interval. A held call is released as soon as the policy no
+// longer holds it or can no longer be read. It returns false when the owning
+// Claude Code process has exited in the meantime.
 func holdUntilAllowed(opts options, sys *system, matcher *patronMatcher, v verdict) bool {
 	pid, _ := strconv.Atoi(strings.TrimSpace(sys.getenv("CLAUDE_PID")))
 	for {
@@ -193,22 +192,13 @@ func holdUntilAllowed(opts options, sys *system, matcher *patronMatcher, v verdi
 		now := sys.now()
 		cfg, err := loadConfig(opts.configPath, sys)
 		if err != nil {
-			// The share may be briefly unreachable: keep the current plan, and
-			// release once its time is up rather than holding blindly.
-			if now.Before(v.Until) {
-				continue
-			}
 			return true
 		}
 		next := evaluate(cfg, now, matcher, opts.usagePath, sys)
-		if next.Hold {
-			v = next
-			continue
+		if !next.Hold {
+			return true
 		}
-		if next.Warning != "" && now.Before(v.Until) {
-			continue // the usage file is unreadable for now; keep the current plan
-		}
-		return true
+		v = next
 	}
 }
 
@@ -264,18 +254,19 @@ func dryRun(opts options, sys *system) int {
 		matcher = fixedPatronMatcher("")
 	}
 
+	w := sys.stdout
+	fmt.Fprintf(w, "now       %s\n", now.Format("2006-01-02 15:04"))
 	cfg, err := loadConfig(opts.configPath, sys)
 	if err != nil {
-		fmt.Fprintln(sys.stderr, "claude-bouncer:", err)
-		return 1
+		fmt.Fprintf(w, "policy    unreadable: %v\n", err)
+		fmt.Fprintln(w, "decision  run: without a readable policy the bouncer is off")
+		return 0
 	}
 	wk, werr := loadWeekly(opts.usagePath, now, sys)
 	v := decide(cfg, now,
 		func() bool { return matcher.Matches(cfg.Patron) },
 		func() (weekly, error) { return wk, werr })
 
-	w := sys.stdout
-	fmt.Fprintf(w, "now       %s\n", now.Format("2006-01-02 15:04"))
 	if v.InWindow {
 		fmt.Fprintf(w, "window    inside %s-%s Mon-Fri, until %s\n", cfg.Start, cfg.End, formatMinute(v.Window.End, now))
 	} else {
