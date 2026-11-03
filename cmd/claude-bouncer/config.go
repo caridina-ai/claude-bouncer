@@ -12,19 +12,29 @@ import (
 	"time"
 )
 
-// config is the shared policy file. It has exactly four fields, all required.
+// defaultFiveHourThreshold applies when the policy leaves five_hour_threshold
+// out, so a policy written for an older version keeps working unchanged.
+const defaultFiveHourThreshold = 95
+
+// config is the shared policy file. The first four fields are required.
 type config struct {
 	Patron       string  // session name (or session ID) that owns the exclusive window
 	Start        clock   // weekday start of the exclusive window, local time
 	End          clock   // weekday end of the exclusive window, local time
 	DailyReserve float64 // percent of the weekly limit kept for the patron per window
+
+	// FiveHourThreshold is the five-hour usage, in percent, at which other
+	// sessions are held before the window and the patron is warned.
+	FiveHourThreshold float64
+	ThresholdDefault  bool // the policy left five_hour_threshold out
 }
 
 type configFile struct {
-	Patron       *string  `json:"patron"`
-	Start        *string  `json:"start"`
-	End          *string  `json:"end"`
-	DailyReserve *float64 `json:"daily_reserve"`
+	Patron            *string  `json:"patron"`
+	Start             *string  `json:"start"`
+	End               *string  `json:"end"`
+	DailyReserve      *float64 `json:"daily_reserve"`
+	FiveHourThreshold *float64 `json:"five_hour_threshold"`
 }
 
 // clock is a time of day, minute precision.
@@ -107,6 +117,15 @@ func parseConfig(data []byte) (config, error) {
 	}
 	if cfg.DailyReserve < 0 || cfg.DailyReserve > 100 {
 		return config{}, errors.New("config: daily_reserve must be between 0 and 100")
+	}
+	if raw.FiveHourThreshold == nil {
+		cfg.FiveHourThreshold = defaultFiveHourThreshold
+		cfg.ThresholdDefault = true
+	} else {
+		cfg.FiveHourThreshold = *raw.FiveHourThreshold
+	}
+	if cfg.FiveHourThreshold < 0 || cfg.FiveHourThreshold > 100 {
+		return config{}, errors.New("config: five_hour_threshold must be between 0 and 100")
 	}
 	return cfg, nil
 }

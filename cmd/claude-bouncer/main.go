@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 const usageText = `claude-bouncer holds Claude Code tool calls to keep quota for a patron session.
 
@@ -104,7 +104,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		fmt.Fprint(stderr, usageText)
 		fs.PrintDefaults()
 	}
-	fs.StringVar(&opts.configPath, "config", "", "policy file: patron, start, end, daily_reserve (required)")
+	fs.StringVar(&opts.configPath, "config", "", "policy file: patron, start, end, daily_reserve, optional five_hour_threshold (required)")
 	fs.StringVar(&opts.usagePath, "usage", "", "usage file published by continue-claude -export (required)")
 	fs.DurationVar(&opts.poll, "poll", opts.poll, "how often a held call re-reads both files")
 	fs.BoolVar(&opts.dryRun, "dry-run", false, "print the decision instead of sleeping")
@@ -158,25 +158,32 @@ func hook(opts options, sys *system) int {
 		return 0
 	}
 	start := sys.now()
-	v := evaluate(cfg, start, matcher, opts.usagePath, sys)
+	v := evaluate(cfg, start, matcher, opts.usagePath, sys, false)
 	if !v.Hold {
+		if v.Alert != "" {
+			writeHookOutput(sys, alertSummary(v, start), "claude-bouncer warning: "+v.Alert)
+		}
 		return 0
 	}
 
-	if !holdUntilAllowed(opts, sys, matcher, v) {
+	final, ok := holdUntilAllowed(opts, sys, matcher, v)
+	if !ok {
 		return 0 // the Claude Code process is gone; nobody is waiting
 	}
-	writeReleaseMessage(sys, v, start, sys.now())
+	writeReleaseMessage(sys, v, final, start, sys.now())
 	return 0
 }
 
 // holdUntilAllowed sleeps while the call stays held, re-reading both files
 // every poll interval, so that editing or renaming the policy takes effect
 // within one interval. A held call is released as soon as the policy no
-// longer holds it or can no longer be read. It returns false when the owning
-// Claude Code process has exited in the meantime.
-func holdUntilAllowed(opts options, sys *system, matcher *patronMatcher, v verdict) bool {
+// longer holds it or can no longer be read; it returns the verdict that
+// released it (empty when the policy could not be read). A call once held by
+// the five-hour guard stays held until the close, even if the block resets
+// meanwhile. It returns false when the owning Claude Code process has exited.
+func holdUntilAllowed(opts options, sys *system, matcher *patronMatcher, v verdict) (verdict, bool) {
 	pid, _ := strconv.Atoi(strings.TrimSpace(sys.getenv("CLAUDE_PID")))
+	tripped := v.FiveHourHold
 	for {
 		wait := v.Until.Sub(sys.now())
 		if wait > opts.poll {
@@ -186,39 +193,61 @@ func holdUntilAllowed(opts options, sys *system, matcher *patronMatcher, v verdi
 			sys.sleep(wait)
 		}
 		if pid > 0 && !sys.alive(pid) {
-			return false
+			return verdict{}, false
 		}
 
 		now := sys.now()
 		cfg, err := loadConfig(opts.configPath, sys)
 		if err != nil {
-			return true
+			return verdict{}, true
 		}
-		next := evaluate(cfg, now, matcher, opts.usagePath, sys)
+		next := evaluate(cfg, now, matcher, opts.usagePath, sys, tripped)
 		if !next.Hold {
-			return true
+			return next, true
 		}
+		tripped = tripped || next.FiveHourHold
 		v = next
 	}
 }
 
-func evaluate(cfg config, now time.Time, matcher *patronMatcher, usagePath string, sys *system) verdict {
+func evaluate(cfg config, now time.Time, matcher *patronMatcher, usagePath string, sys *system, tripped bool) verdict {
 	return decide(cfg, now,
 		func() bool { return matcher.Matches(cfg.Patron) },
-		func() (weekly, error) { return loadWeekly(usagePath, now, sys) })
+		func() usage { return loadUsage(usagePath, now, sys) },
+		tripped)
 }
 
 // writeReleaseMessage tells the user, and Claude, that the call was held, so
-// a session that resumes hours later knows that time has passed.
-func writeReleaseMessage(sys *system, first verdict, from, to time.Time) {
+// a session that resumes hours later knows that time has passed. The verdict
+// that released the call may carry a warning for the patron too.
+func writeReleaseMessage(sys *system, first, final verdict, from, to time.Time) {
 	held := fmt.Sprintf("%s to %s", formatMinute(from, to), formatMinute(to, from))
+	user := fmt.Sprintf("claude-bouncer held this call from %s (%s)", held, first.Reason)
+	claude := fmt.Sprintf(
+		"claude-bouncer held this tool call from %s to %s local time (%s). Time has passed since the call was made; refresh anything time-sensitive before relying on it.",
+		from.Format("2006-01-02 15:04"), to.Format("2006-01-02 15:04"), first.Reason)
+	if final.Alert != "" {
+		user += "; " + alertSummary(final, to)
+		claude += " Warning: " + final.Alert
+	}
+	writeHookOutput(sys, user, claude)
+}
+
+// alertSummary is the user-facing line for a warning sent to the patron.
+func alertSummary(v verdict, now time.Time) string {
+	return fmt.Sprintf("claude-bouncer warned this session: 5-hour limit %s%% used, resets %s",
+		formatPercent(v.FiveHour.Used), formatMinute(v.FiveHour.Reset, now))
+}
+
+// writeHookOutput prints the PreToolUse JSON: systemMessage for the user,
+// additionalContext for Claude. It sets no permission decision, so the normal
+// permission flow is untouched.
+func writeHookOutput(sys *system, user, claude string) {
 	out := map[string]any{
-		"systemMessage": fmt.Sprintf("claude-bouncer held this call from %s (%s)", held, first.Reason),
+		"systemMessage": user,
 		"hookSpecificOutput": map[string]any{
-			"hookEventName": "PreToolUse",
-			"additionalContext": fmt.Sprintf(
-				"claude-bouncer held this tool call from %s to %s local time (%s). Time has passed since the call was made; refresh anything time-sensitive before relying on it.",
-				from.Format("2006-01-02 15:04"), to.Format("2006-01-02 15:04"), first.Reason),
+			"hookEventName":     "PreToolUse",
+			"additionalContext": claude,
 		},
 	}
 	data, err := json.Marshal(out)
@@ -262,10 +291,11 @@ func dryRun(opts options, sys *system) int {
 		fmt.Fprintln(w, "decision  run: without a readable policy the bouncer is off")
 		return 0
 	}
-	wk, werr := loadWeekly(opts.usagePath, now, sys)
+	u := loadUsage(opts.usagePath, now, sys)
 	v := decide(cfg, now,
 		func() bool { return matcher.Matches(cfg.Patron) },
-		func() (weekly, error) { return wk, werr })
+		func() usage { return u },
+		false)
 
 	if v.InWindow {
 		fmt.Fprintf(w, "window    inside %s-%s Mon-Fri, until %s\n", cfg.Start, cfg.End, formatMinute(v.Window.End, now))
@@ -277,7 +307,7 @@ func dryRun(opts options, sys *system) int {
 		name = "(unknown)"
 	}
 	fmt.Fprintf(w, "session   %s, patron %q: %s\n", name, cfg.Patron, yesNo(matcher.Matches(cfg.Patron)))
-	if werr != nil {
+	if wk, werr := u.weekly(); werr != nil {
 		fmt.Fprintf(w, "weekly    unavailable: %v\n", werr)
 	} else {
 		note := ""
@@ -288,17 +318,42 @@ func dryRun(opts options, sys *system) int {
 		windows := cfg.windowsBefore(now, wk.Reset)
 		fmt.Fprintf(w, "reserve   %s%% x %d window(s) before reset = %s%%\n", formatPercent(cfg.DailyReserve), windows, formatPercent(round1(cfg.DailyReserve*float64(windows))))
 	}
+	threshold := formatPercent(cfg.FiveHourThreshold) + "%"
+	if cfg.ThresholdDefault {
+		threshold += " (default)"
+	}
+	switch fh, ferr := u.fiveHour(); {
+	case ferr != nil:
+		fmt.Fprintf(w, "5-hour    unavailable: %v\n", ferr)
+	case !fh.Active:
+		fmt.Fprintf(w, "5-hour    no block running (the last one reset %s), threshold %s\n", formatMinute(fh.Reset, now), threshold)
+	default:
+		fmt.Fprintf(w, "5-hour    used %s%%, block %s-%s, threshold %s\n", formatPercent(fh.Used), formatMinute(fh.Start(), now), formatMinute(fh.Reset, now), threshold)
+	}
+	guardFrom := v.Window.Start.Add(-guardLead)
+	if v.Guarded {
+		fmt.Fprintf(w, "guard     on since %s, until the close %s\n", formatMinute(guardFrom, now), formatMinute(v.Window.End, now))
+	} else {
+		fmt.Fprintf(w, "guard     off until %s, 5h before the open\n", formatMinute(guardFrom, now))
+	}
 	switch {
 	case v.Hold:
 		fmt.Fprintf(w, "decision  hold until %s: %s\n", formatMinute(v.Until, now), v.Reason)
-	case v.Warning != "":
-		fmt.Fprintf(w, "decision  run (%s)\n", v.Warning)
+	case v.Alert != "":
+		fmt.Fprintf(w, "decision  run, and warn the patron: %s\n", v.Alert)
+	case v.Unchecked != "":
+		fmt.Fprintf(w, "decision  run (%s)\n", v.Unchecked)
 	case v.InWindow:
 		fmt.Fprintln(w, "decision  run: the patron owns this window")
-	case v.Reserve <= 0:
-		fmt.Fprintln(w, "decision  run: nothing to reserve before the weekly reset")
 	default:
-		fmt.Fprintln(w, "decision  run: the weekly limit left is above the reserve")
+		msg := "the weekly limit left is above the reserve"
+		if v.Reserve <= 0 {
+			msg = "nothing to reserve before the weekly reset"
+		}
+		if v.FiveHourChecked {
+			msg += ", and the 5-hour limit is below the threshold"
+		}
+		fmt.Fprintln(w, "decision  run: "+msg)
 	}
 	return 0
 }
@@ -338,16 +393,16 @@ func loadConfig(path string, sys *system) (config, error) {
 	return cfg, nil
 }
 
-func loadWeekly(path string, now time.Time, sys *system) (weekly, error) {
+func loadUsage(path string, now time.Time, sys *system) usage {
 	expanded, err := expandUserPath(path, sys)
 	if err != nil {
-		return weekly{}, err
+		return usage{Err: err}
 	}
 	data, err := sys.readFile(expanded)
 	if err != nil {
-		return weekly{}, fmt.Errorf("read usage file: %w", err)
+		return usage{Err: fmt.Errorf("read usage file: %w", err)}
 	}
-	return parseWeekly(data, now)
+	return parseUsage(data, now)
 }
 
 // readFileRetry reads a file, retrying briefly on errors other than "not
